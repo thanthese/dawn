@@ -1,39 +1,98 @@
 package main
 
+// the postgres driver to use, I think
+// https://github.com/jackc/pgx
+//
+// put in import, then:
+// 		> go get .
+
 import (
+	"database/sql"
 	"fmt"
-	"sync"
-	"time"
+	"log"
+	"os"
+
+	"github.com/go-sql-driver/mysql"
 )
 
-// SafeCounter is safe to use concurrently.
-type SafeCounter struct {
-	mu sync.Mutex
-	v  map[string]int
-}
+var db *sql.DB
 
-// Inc increments the counter for the given key.
-func (c *SafeCounter) Inc(key string) {
-	c.mu.Lock()
-	// Lock so only one goroutine at a time can access the map c.v.
-	c.v[key]++
-	c.mu.Unlock()
-}
-
-// Value returns the current value of the counter for the given key.
-func (c *SafeCounter) Value(key string) int {
-	c.mu.Lock()
-	// Lock so only one goroutine at a time can access the map c.v.
-	defer c.mu.Unlock()
-	return c.v[key]
+type Album struct {
+	ID     int64
+	Title  string
+	Artist string
+	Price  float32
 }
 
 func main() {
-	c := SafeCounter{v: make(map[string]int)}
-	for i := 0; i < 1000; i++ {
-		go c.Inc("somekey")
+	// Capture connection properties.
+	cfg := mysql.Config{
+		User:   os.Getenv("DBUSER"),
+		Passwd: os.Getenv("DBPASS"),
+		Net:    "tcp",
+		Addr:   "127.0.0.1:3306",
+		DBName: "recordings",
 	}
-	// making a trivial change
-	time.Sleep(time.Second)
-	fmt.Println(c.Value("somekey"))
+	// Get a database handle.
+	var err error
+	db, err = sql.Open("mysql", cfg.FormatDSN())
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	pingErr := db.Ping()
+	if pingErr != nil {
+		log.Fatal(pingErr)
+	}
+	fmt.Println("Connected!")
+
+	albs, err := albumsByArtist("John Coltrane")
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("Albums found: %v\n", albs)
+	alb, err := albumByID(1)
+	if err != nil {
+		fmt.Println("alb 1 not found")
+	}
+	fmt.Println("Album by id", alb)
+}
+
+// albumsByArtist queries for albums that have the specified artist name.
+func albumsByArtist(name string) ([]Album, error) {
+	// An albums slice to hold data from returned rows.
+	var albums []Album
+
+	rows, err := db.Query("SELECT * FROM album WHERE artist = ?", name)
+	if err != nil {
+		return nil, fmt.Errorf("albumsByArtist %q: %v", name, err)
+	}
+	defer rows.Close()
+	// Loop through rows, using Scan to assign column data to struct fields.
+	for rows.Next() {
+		var alb Album
+		if err := rows.Scan(&alb.ID, &alb.Title, &alb.Artist, &alb.Price); err != nil {
+			return nil, fmt.Errorf("albumsByArtist %q: %v", name, err)
+		}
+		albums = append(albums, alb)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("albumsByArtist %q: %v", name, err)
+	}
+	return albums, nil
+}
+
+// albumByID queries for the album with the specified ID.
+func albumByID(id int64) (Album, error) {
+	// An album to hold data from the returned row.
+	var alb Album
+
+	row := db.QueryRow("SELECT * FROM album WHERE id = ?", id)
+	if err := row.Scan(&alb.ID, &alb.Title, &alb.Artist, &alb.Price); err != nil {
+		if err == sql.ErrNoRows {
+			return alb, fmt.Errorf("albumsById %d: no such album", id)
+		}
+		return alb, fmt.Errorf("albumsById %d: %v", id, err)
+	}
+	return alb, nil
 }
