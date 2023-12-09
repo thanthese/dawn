@@ -2,5 +2,4 @@
 export DBUSER=root
 export DBPASS=
 
-echo "DBUSER is"
-echo $DBUSER
+echo "DBUSER is $DBUSER"
