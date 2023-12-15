@@ -1,21 +1,15 @@
 package main
 
-// the postgres driver to use, I think
-// https://github.com/jackc/pgx
-//
-// put in import, then:
-// 		> go get .
-
 import (
-	"database/sql"
+	"context"
 	"fmt"
 	"log"
 	"os"
+	"time"
 
-	"github.com/go-sql-driver/mysql"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
-
-var db *sql.DB
 
 type Album struct {
 	ID     int64
@@ -25,100 +19,70 @@ type Album struct {
 }
 
 func main() {
-	// Capture connection properties.
-	cfg := mysql.Config{
-		User:   os.Getenv("DBUSER"),
-		Passwd: os.Getenv("DBPASS"),
-		Net:    "tcp",
-		Addr:   "127.0.0.1:3306",
-		DBName: "recordings",
-	}
-	// Get a database handle.
-	var err error
-	db, err = sql.Open("mysql", cfg.FormatDSN())
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	dbpool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Unable to create connection pool: %v\n", err)
 	}
+	defer dbpool.Close()
 
-	pingErr := db.Ping()
-	if pingErr != nil {
-		log.Fatal(pingErr)
+	var userName string
+	err = dbpool.QueryRow(ctx, "select CURRENT_USER").Scan(&userName)
+	if err != nil {
+		log.Fatalf("QueryRow failed: %v\n", err)
 	}
-	fmt.Println("Connected!")
+	fmt.Printf("Current user is '%s'\n", userName)
 
-	albs, err := albumsByArtist("John Coltrane")
+	albs, err := albumsByArtist(dbpool, ctx, "John Coltrane")
 	if err != nil {
 		log.Fatal(err)
 	}
 	fmt.Printf("Albums found: %v\n", albs)
 
-	// Hard-code ID 2 here to test the query.
-	alb, err := albumByID(2)
+	err = addAlbum(dbpool, ctx, Album{
+		Title:  "Abbey Road",
+		Artist: "Beatles",
+		Price:  10})
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("Album found: %v\n", alb)
 
-	albID, err := addAlbum(Album{
-		Title:  "The Modern Sound of Betty Carter",
-		Artist: "Betty Carter",
-		Price:  49.99,
-	})
+	count, err := rowsCount(dbpool, ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("ID of added album: %v\n", albID)
+	fmt.Printf("Number of rows in album: %v", count)
 }
 
-// addAlbum adds the specified album to the database,
-// returning the album ID of the new entry
-func addAlbum(alb Album) (int64, error) {
-	result, err := db.Exec("INSERT INTO album (title, artist, price) VALUES (?, ?, ?)", alb.Title, alb.Artist, alb.Price)
+func rowsCount(dbpool *pgxpool.Pool, ctx context.Context) (count int, err error) {
+	err = dbpool.QueryRow(ctx, "select count(*) from album;").Scan(&count)
 	if err != nil {
-		return 0, fmt.Errorf("addAlbum: %v", err)
+		return 0, fmt.Errorf("couldn't get count: %w", err)
 	}
-	id, err := result.LastInsertId()
-	if err != nil {
-		return 0, fmt.Errorf("addAlbum: %v", err)
-	}
-	return id, nil
+	return count, nil
 }
 
-// albumsByArtist queries for albums that have the specified artist name.
-func albumsByArtist(name string) ([]Album, error) {
-	// An albums slice to hold data from returned rows.
-	var albums []Album
-
-	rows, err := db.Query("SELECT * FROM album WHERE artist = ?", name)
+func albumsByArtist(dbpool *pgxpool.Pool, ctx context.Context, name string) ([]Album, error) {
+	rows, err := dbpool.Query(ctx, "select * from album where artist = $1", name)
 	if err != nil {
-		return nil, fmt.Errorf("albumsByArtist %q: %v", name, err)
+		return nil, fmt.Errorf("make connection, albumsByArtist %q: %v", name, err)
 	}
 	defer rows.Close()
-	// Loop through rows, using Scan to assign column data to struct fields.
-	for rows.Next() {
-		var alb Album
-		if err := rows.Scan(&alb.ID, &alb.Title, &alb.Artist, &alb.Price); err != nil {
-			return nil, fmt.Errorf("albumsByArtist %q: %v", name, err)
-		}
-		albums = append(albums, alb)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("albumsByArtist %q: %v", name, err)
-	}
-	return albums, nil
+
+	return pgx.CollectRows(rows, pgx.RowToStructByName[Album])
 }
 
-// albumByID queries for the album with the specified ID.
-func albumByID(id int64) (Album, error) {
-	// An album to hold data from the returned row.
-	var alb Album
-
-	row := db.QueryRow("SELECT * FROM album WHERE id = ?", id)
-	if err := row.Scan(&alb.ID, &alb.Title, &alb.Artist, &alb.Price); err != nil {
-		if err == sql.ErrNoRows {
-			return alb, fmt.Errorf("albumsById %d: no such album", id)
-		}
-		return alb, fmt.Errorf("albumsById %d: %v", id, err)
+func addAlbum(dbpool *pgxpool.Pool, ctx context.Context, alb Album) error {
+	query := `INSERT INTO album (title, artist, price) VALUES (@title, @artist, @price)`
+	args := pgx.NamedArgs{
+		"title":  alb.Title,
+		"artist": alb.Artist,
+		"price":  alb.Price,
 	}
-	return alb, nil
+	_, err := dbpool.Exec(ctx, query, args)
+	if err != nil {
+		return fmt.Errorf("unable to insert row: %w", err)
+	}
+	return nil
 }
